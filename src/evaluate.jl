@@ -77,6 +77,36 @@ function get_compilecache(config::Configuration)
     end
 end
 
+# The shared compilecaches grow without bound (every evaluation rsyncs its
+# newly-compiled files back in), eventually filling the temporary filesystem
+# and failing evaluations during setup (ENOSPC from `mktempdir`). When the
+# available space drops below a floor, empty them. Only their contents: the
+# directories may be bind-mounted into active sandboxes and are rsynced into
+# by path when evaluations finish, so they must stay in place.
+tempdisk_floor() =
+    something(tryparse(Int, get(ENV, "PKGEVAL_TEMPDISK_FLOOR_GB", "")), 32) * Int64(2)^30
+function ensure_tempdisk_space()
+    available = try
+        Base.diskstat(tempdir()).available
+    catch
+        return  # no disk statistics on this platform; fail open
+    end
+    available >= tempdisk_floor() && return
+    # storage_lock keeps a finishing evaluation's rsync from racing the purge
+    lock(storage_lock) do
+        lock(compiled_lock) do
+            for dir in values(compiled_cache)
+                chmod_recursive(dir, 0o777) # JuliaLang/julia#47650
+                for entry in readdir(dir; join=true)
+                    rm(entry; recursive=true, force=true)
+                end
+            end
+        end
+    end
+    @warn "Temporary disk space is low; emptied the shared compilecaches" available
+    return
+end
+
 """
     evaluate_script(config::Configuration, script::String, args=``)
 
@@ -280,6 +310,9 @@ function evaluate_package(config::Configuration, pkg::Package; use_cache::Bool=t
 
     mounts = copy(mounts)
     env = copy(env)
+
+    # make room before we add to the temporary disk
+    ensure_tempdisk_space()
 
     if config.compiled
         return evaluate_compiled_test(config, pkg; use_cache, kwargs...)
